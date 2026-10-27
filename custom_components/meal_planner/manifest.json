@@ -1,0 +1,22 @@
+{
+  "domain": "meal_planner",
+  "name": "Mein Speiseplan",
+  "version": "1.0.2",
+  "documentation": "https://github.com/Bammerstefan/ha-meal-planner",
+  "issue_tracker": "https://github.com/Bammerstefan/ha-meal-planner/issues",
+  "codeowners": [
+    "@Bammerstefan"
+  ],
+  "config_flow": true,
+  "integration_type": "service",
+  "dependencies": [
+    "frontend",
+    "http",
+    "panel_custom",
+    "websocket_api"
+  ],
+  "iot_class": "local_push",
+  "requirements": [
+    "qrcode==8.2"
+  ]
+}

@@ -1,0 +1,1 @@
+{"config":{"step":{"user":{"title":"Set up Meal Planner","description":"Creates a local meal plan with recipes and a shopping list."}},"abort":{"single_instance_allowed":"Meal Planner is already configured."}}}
