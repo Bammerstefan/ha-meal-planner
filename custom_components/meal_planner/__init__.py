@@ -25,7 +25,7 @@ import tempfile
 import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.9"
+UI_VERSION = "1.0.10"
 
 # Mengen für Warnungen auf eine gemeinsame Basiseinheit umrechnen.
 def _quantity(raw):
@@ -124,6 +124,7 @@ async def async_setup_entry(hass, entry):
     # Große RTK-Dateien in begrenzten WebSocket-Blöcken empfangen. Dateien sind
     # nur an die aktuelle WebSocket-Verbindung gebunden und werden aufgeräumt.
     rtk_uploads = {}
+    rtk_previews = {}
 
     def _clear_rtk(conn_key):
         upload = rtk_uploads.pop(conn_key, None)
@@ -152,10 +153,12 @@ async def async_setup_entry(hass, entry):
                     _clear_rtk(old_key)
             action = msg['action']
             if action == 'cancel':
+                rtk_previews.pop(key, None)
                 _clear_rtk(key)
                 connection.send_result(msg['id'], {'cancelled': True})
                 return
             if action == 'start':
+                rtk_previews.pop(key, None)
                 _clear_rtk(key)
                 size = msg['size']
                 if not 0 < size <= 80_000_000:
@@ -189,7 +192,8 @@ async def async_setup_entry(hass, entry):
                     return parse_rtk(stream.read())
             try:
                 recipes = await hass.async_add_executor_job(_read_parse)
-                connection.send_result(msg['id'], {'recipes': recipes})
+                rtk_previews[key] = {'recipes': recipes, 'created': monotonic()}
+                connection.send_result(msg['id'], {'total': len(recipes), 'paged': True})
             finally:
                 _clear_rtk(key)
         except Exception as exc:
@@ -271,6 +275,132 @@ async def async_setup_entry(hass, entry):
             connection.send_error(msg['id'],'import_failed',str(exc)[:400])
         except Exception:
             connection.send_error(msg['id'],'import_failed','Import konnte nicht verarbeitet werden.')
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/rtk_preview_page', vol.Required('offset'): vol.All(int, vol.Range(min=0))})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_rtk_preview_page(hass, connection, msg):
+        item = rtk_previews.get(id(connection))
+        if not item or monotonic() - item['created'] > 900:
+            rtk_previews.pop(id(connection), None)
+            connection.send_error(msg['id'], 'expired', 'Importvorschau abgelaufen. Bitte Datei erneut wählen.')
+            return
+        index = msg['offset']
+        recipes = item['recipes']
+        connection.send_result(msg['id'], {'recipes': recipes[index:index+10], 'total': len(recipes)})
+
+    # Imported recipe photos are saved separately in Home Assistant's backed-up .storage.
+    # Only authenticated administrators can write/read these files through WebSockets.
+    images_dir = Path(hass.config.path(".storage", "meal_planner_images"))
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    def recipes_license_active():
+        lic = hass.data[DOMAIN]['license_data']
+        for token in lic.get('tokens', []):
+            try:
+                if 'recipes_pro' in verify_license(token, lic['installation_id'])['modules']:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/photo_store', vol.Required('data'): str})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_photo_store(hass, connection, msg):
+        if not recipes_license_active():
+            connection.send_error(msg['id'], 'license_required', 'Rezeptbuch PRO benötigt eine gültige Lizenz.')
+            return
+        try:
+            data_url = msg['data']
+            if len(data_url) > 800_000 or not data_url.startswith('data:image/jpeg;base64,'):
+                raise ValueError('Nur JPEG-Bilder bis ca. 600 KB sind erlaubt.')
+            raw = base64.b64decode(data_url.split(',', 1)[1], validate=True)
+            if len(raw) > 590_000 or not raw.startswith(b'\xff\xd8\xff') or not raw.endswith(b'\xff\xd9'):
+                raise ValueError('Ungültiges oder zu großes JPEG-Bild.')
+            name = uuid.uuid4().hex
+            def _write():
+                target = images_dir / (name + '.jpg')
+                with target.open('xb') as dest:
+                    dest.write(raw)
+            await hass.async_add_executor_job(_write)
+            connection.send_result(msg['id'], {'photo_ref': name})
+        except (ValueError, OSError) as exc:
+            connection.send_error(msg['id'], 'photo_failed', str(exc))
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/photo_get', vol.Required('refs'): list})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_photo_get(hass, connection, msg):
+        refs = msg['refs']
+        if len(refs) > 8 or any(not isinstance(ref, str) or not re.fullmatch(r'[a-f0-9]{32}', ref) for ref in refs):
+            connection.send_error(msg['id'], 'bad_refs', 'Ungültige Bildreferenzen.')
+            return
+        def _read():
+            photos = {}
+            for ref in refs:
+                path = images_dir / (ref + '.jpg')
+                try:
+                    if path.stat().st_size < 600_000:
+                        photos[ref] = 'data:image/jpeg;base64,' + base64.b64encode(path.read_bytes()).decode('ascii')
+                except OSError:
+                    continue
+            return photos
+        connection.send_result(msg['id'], {'photos': await hass.async_add_executor_job(_read)})
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/import_recipe_batch', vol.Required('recipes'): list})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_import_recipe_batch(hass, connection, msg):
+        if not recipes_license_active():
+            connection.send_error(msg['id'], 'license_required', 'Rezeptbuch PRO benötigt eine gültige Lizenz.')
+            return
+        batch = msg['recipes']
+        if not 1 <= len(batch) <= 10 or len(str(batch)) > 240_000:
+            connection.send_error(msg['id'], 'invalid_batch', 'Importpaket zu groß (max. 10 Rezepte).')
+            return
+        current = hass.data[DOMAIN]['data']
+        existing = {str(r.get('name', '')).strip().casefold() for r in current.get('recipes', []) if isinstance(r, dict)}
+        new = []
+        for source in batch:
+            if not isinstance(source, dict):
+                continue
+            name = str(source.get('name', '')).strip()[:120]
+            key = name.casefold()
+            if not key or key in existing:
+                continue
+            ref = source.get('photo_ref', '')
+            if ref and (not isinstance(ref, str) or not re.fullmatch(r'[a-f0-9]{32}', ref) or not (images_dir / (ref + '.jpg')).is_file()):
+                connection.send_error(msg['id'], 'invalid_photo', 'Bildreferenz nicht vorhanden.')
+                return
+            ingredients = source.get('ingredients', [])
+            if not isinstance(ingredients, list):
+                ingredients = []
+            clean_ingredients = [{'name': str(i.get('name', ''))[:160], 'quantity': str(i.get('quantity', ''))[:60]}
+                for i in ingredients[:150] if isinstance(i, dict)]
+            try:
+                portions = max(1, min(50, int(source.get('servings', 4))))
+            except (TypeError, ValueError):
+                portions = 4
+            instructions = str(source.get('instructions', source.get('notes', '')))[:12000]
+            new.append({'id': uuid.uuid4().hex, 'name': name, 'ingredients': clean_ingredients,
+                'instructions': instructions, 'notes': instructions,
+                'category': str(source.get('category', ''))[:60], 'servings': portions,
+                'photo_mode': 'custom' if ref else 'symbol', 'photo_symbol': '🍲',
+                'photo_data': '', 'photo_ref': ref,
+                'source_url': str(source.get('source_url', ''))[:700],
+                'source_id': str(source.get('source_id', ''))[:80]})
+            existing.add(key)
+        if new:
+            updated = deepcopy(current)
+            updated['recipes'] = [*current.get('recipes', []), *new]
+            try:
+                await store.async_save(updated)
+            except Exception:
+                connection.send_error(msg['id'], 'save_failed', 'Speichern fehlgeschlagen, bisherige Daten unverändert.')
+                return
+            hass.data[DOMAIN]['data'] = updated
+        connection.send_result(msg['id'], {'added': len(new), 'skipped': len(batch) - len(new)})
 
     @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/version"})
     @websocket_api.require_admin
@@ -637,6 +767,10 @@ async def async_setup_entry(hass, entry):
     websocket_api.async_register_command(hass, ws_activate)
     websocket_api.async_register_command(hass, ws_qr)
     websocket_api.async_register_command(hass, ws_version)
+    websocket_api.async_register_command(hass, ws_rtk_preview_page)
+    websocket_api.async_register_command(hass, ws_photo_store)
+    websocket_api.async_register_command(hass, ws_photo_get)
+    websocket_api.async_register_command(hass, ws_import_recipe_batch)
     websocket_api.async_register_command(hass, ws_get)
     websocket_api.async_register_command(hass, ws_save)
     websocket_api.async_register_command(hass, ws_export)

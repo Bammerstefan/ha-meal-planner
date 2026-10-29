@@ -30,7 +30,7 @@ def _clean(s,limit):
 
 
 
-def _image_to_data_url(raw, max_edge=640, quality=78):
+def _image_to_data_url(raw, max_edge=480, quality=68):
     try:
         with Image.open(io.BytesIO(raw)) as img:
             img=ImageOps.exif_transpose(img)

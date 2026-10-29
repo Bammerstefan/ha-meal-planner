@@ -1,3 +1,8 @@
+## v1.0.10
+- RTK-Vorschau in kleinen Seiten
+- Bildablage außerhalb der Rezeptdaten
+- Rezeptimport in Gruppen mit Fortschrittsanzeige
+
 ## v1.0.9
 - My Recipe Box: Bilder aus RTK-Backups werden importiert.
 - Zusätzliche RTK-Bilder können in der Importvorschau ausgewählt werden.
