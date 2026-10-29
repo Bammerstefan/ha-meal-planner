@@ -22,7 +22,7 @@ import asyncio
 import socket
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.3"
+UI_VERSION = "1.0.5"
 
 # Mengen für Warnungen auf eine gemeinsame Basiseinheit umrechnen.
 def _quantity(raw):
@@ -153,6 +153,37 @@ async def async_setup_entry(hass, entry):
                     if len(raw)>1_000_000:raise ValueError('Webseite zu groß.')
                     html=raw.decode(response.charset or 'utf-8',errors='replace')
                 recipes=parse_webpage(html,value)
+            if msg['source']=='url' and recipes and recipes[0].get('image_url'):
+                image_url=recipes[0]['image_url']
+                try:
+                    # Resolve and pin a globally routable address to prevent DNS rebinding.
+                    from urllib.parse import urlsplit
+                    from aiohttp import ClientSession, TCPConnector, ClientTimeout
+                    from aiohttp.abc import AbstractResolver
+                    image_host=public_hostname(image_url)
+                    ip_records=await asyncio.get_running_loop().getaddrinfo(image_host,443,type=socket.SOCK_STREAM)
+                    image_addresses=list(dict.fromkeys(r[4][0] for r in ip_records))
+                    public_dns_addresses(image_addresses)
+                    class _PinnedResolver(AbstractResolver):
+                        async def resolve(self, host, port=0, family=socket.AF_INET):
+                            return [{'hostname':host,'host':ip,'port':port,'family':socket.AF_INET6 if ':' in ip else socket.AF_INET,'proto':0,'flags':0} for ip in image_addresses]
+                        async def close(self): pass
+                    connector=TCPConnector(resolver=_PinnedResolver(),use_dns_cache=False,limit=1)
+                    async with ClientSession(connector=connector,trust_env=False,timeout=ClientTimeout(total=12)) as image_session:
+                        async with image_session.get(image_url,allow_redirects=False,headers={'Accept':'image/jpeg,image/png,image/webp'}) as image_response:
+                            kind=image_response.headers.get('Content-Type','').split(';')[0].strip().lower()
+                            if image_response.status==200 and kind in ('image/jpeg','image/png','image/webp') and (not image_response.content_length or image_response.content_length<=1_500_000):
+                                image_bytes=await image_response.content.read(1_500_001)
+                                if len(image_bytes)<=1_500_000:
+                                    import base64
+                                    # Verify basic file signature rather than trusting headers alone.
+                                    valid=(kind=='image/jpeg' and image_bytes.startswith(b'\xff\xd8\xff')) or (kind=='image/png' and image_bytes.startswith(b'\x89PNG\r\n\x1a\n')) or (kind=='image/webp' and image_bytes[:4]==b'RIFF' and image_bytes[8:12]==b'WEBP')
+                                    if valid:
+                                        recipes[0]['photo_data']='data:'+kind+';base64,'+base64.b64encode(image_bytes).decode('ascii')
+                                        recipes[0]['photo_mode']='custom'
+                except Exception:
+                    # Some sites disallow downloading images. Recipe text remains importable.
+                    pass
             connection.send_result(msg['id'],{'recipes':recipes})
         except (ValueError,TimeoutError,OSError,UnicodeError,ImportError,KeyError) as exc:
             connection.send_error(msg['id'],'import_failed',str(exc)[:400])

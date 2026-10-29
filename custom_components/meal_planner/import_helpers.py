@@ -7,7 +7,7 @@ import re
 import socket
 import zipfile
 from html.parser import HTMLParser
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urljoin
 
 
 def _ingredients(value):
@@ -81,6 +81,24 @@ def _find_recipe(item):
     return None
 
 
+def recipe_image_url(value, page_url):
+    """Choose the first schema.org Recipe image URL without fetching it."""
+    candidates = value if isinstance(value, list) else [value]
+    for item in candidates[:12]:
+        if isinstance(item, dict):
+            item = item.get('url') or item.get('contentUrl') or item.get('thumbnailUrl')
+        if not isinstance(item, str) or not item.strip():
+            continue
+        candidate = urljoin(page_url, item.strip())
+        try:
+            public_hostname(candidate)
+        except (ValueError, TypeError):
+            continue
+        if len(candidate) <= 2000:
+            return candidate
+    return ''
+
+
 def parse_webpage(html,url):
     parser=_JsonLd();parser.feed(html)
     for block in parser.blocks:
@@ -98,7 +116,7 @@ def parse_webpage(html,url):
         m=re.search(r'\d+',str(servings));servings=max(1,min(50,int(m.group()) if m else 4))
         category=r.get('recipeCategory','');category=category[0] if isinstance(category,list) and category else category
         instruction=_clean(instruction,12000)
-        return [{'name':title,'ingredients':_ingredients(r.get('recipeIngredient',[])),'instructions':instruction,'notes':instruction,'category':_clean(category,60),'servings':servings,'photo_mode':'symbol','photo_symbol':'🍲','photo_data':'','source_url':url}]
+        return [{'name':title,'ingredients':_ingredients(r.get('recipeIngredient',[])),'instructions':instruction,'notes':instruction,'category':_clean(category,60),'servings':servings,'photo_mode':'symbol','photo_symbol':'🍲','photo_data':'','image_url':recipe_image_url(r.get('image') or r.get('thumbnailUrl'),url),'source_url':url}]
     raise ValueError('Diese Webseite enthält keine erkennbaren strukturierten Rezeptdaten (schema.org/Recipe).')
 
 
