@@ -20,9 +20,12 @@ from .import_helpers import parse_rtk, parse_webpage, public_hostname, public_dn
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import asyncio
 import socket
+import base64
+import tempfile
+import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.6"
+UI_VERSION = "1.0.9"
 
 # Mengen für Warnungen auf eine gemeinsame Basiseinheit umrechnen.
 def _quantity(raw):
@@ -118,6 +121,81 @@ async def async_setup_entry(hass, entry):
     unsubscribe = async_track_time_change(hass, _daily_reminders, minute=0, second=0)
     hass.data[DOMAIN]["reminder_unsubscribe"] = unsubscribe
 
+    # Große RTK-Dateien in begrenzten WebSocket-Blöcken empfangen. Dateien sind
+    # nur an die aktuelle WebSocket-Verbindung gebunden und werden aufgeräumt.
+    rtk_uploads = {}
+
+    def _clear_rtk(conn_key):
+        upload = rtk_uploads.pop(conn_key, None)
+        if upload:
+            try: os.unlink(upload['path'])
+            except OSError: pass
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/rtk_upload',
+        vol.Required('action'): vol.In(['start', 'chunk', 'finish', 'cancel']),
+        vol.Optional('data', default=''): str, vol.Optional('size', default=0): vol.All(int, vol.Range(min=0))})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_rtk_upload(hass, connection, msg):
+        key = id(connection)
+        try:
+            lic = hass.data[DOMAIN]['license_data']
+            active = set()
+            for token in lic.get('tokens', []):
+                try: active.update(verify_license(token, lic['installation_id'])['modules'])
+                except ValueError: continue
+            if 'recipes_pro' not in active:
+                raise ValueError('Rezeptbuch PRO benötigt eine gültige Lizenz.')
+            now = monotonic()
+            for old_key, old in list(rtk_uploads.items()):
+                if now - old['created'] > 900:
+                    _clear_rtk(old_key)
+            action = msg['action']
+            if action == 'cancel':
+                _clear_rtk(key)
+                connection.send_result(msg['id'], {'cancelled': True})
+                return
+            if action == 'start':
+                _clear_rtk(key)
+                size = msg['size']
+                if not 0 < size <= 80_000_000:
+                    raise ValueError('RTK-Datei muss zwischen 1 Byte und 80 MB groß sein.')
+                fd, path = tempfile.mkstemp(prefix='meal_rtk_', suffix='.rtk')
+                os.close(fd)
+                rtk_uploads[key] = {'path': path, 'size': size, 'written': 0, 'created': now}
+                connection.send_result(msg['id'], {'ready': True})
+                return
+            upload = rtk_uploads.get(key)
+            if not upload:
+                raise ValueError('Import-Sitzung abgelaufen. Datei bitte erneut auswählen.')
+            if action == 'chunk':
+                b64 = msg['data']
+                if not 0 < len(b64) <= 350_000:
+                    raise ValueError('Ungültige Blockgröße.')
+                block = base64.b64decode(b64, validate=True)
+                if len(block) > 256 * 1024 or upload['written'] + len(block) > upload['size']:
+                    raise ValueError('Importblock zu groß.')
+                with open(upload['path'], 'ab') as stream:
+                    stream.write(block)
+                upload['written'] += len(block)
+                connection.send_result(msg['id'], {'received': upload['written']})
+                return
+            if upload['written'] != upload['size']:
+                raise ValueError('Importdatei wurde nicht vollständig übertragen.')
+            path = upload['path']
+            # Lese/ZIP-Parsing im Executor, damit Home Assistant responsiv bleibt.
+            def _read_parse():
+                with open(path, 'rb') as stream:
+                    return parse_rtk(stream.read())
+            try:
+                recipes = await hass.async_add_executor_job(_read_parse)
+                connection.send_result(msg['id'], {'recipes': recipes})
+            finally:
+                _clear_rtk(key)
+        except Exception as exc:
+            _clear_rtk(key)
+            connection.send_error(msg['id'], 'rtk_upload_failed', str(exc)[:300] if isinstance(exc, (ValueError, OSError)) else 'RTK-Import fehlgeschlagen.')
+
     @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/import_preview', vol.Required('source'): vol.In(['rtk','url']), vol.Required('value'): str})
     @websocket_api.require_admin
     @websocket_api.async_response
@@ -133,7 +211,7 @@ async def async_setup_entry(hass, entry):
         try:
             value=msg['value']
             if msg['source']=='rtk':
-                if len(value)>7_000_000:raise ValueError('Die Datei ist zu groß.')
+                if len(value)>26_700_000:raise ValueError('Die RTK-Datei ist zu groß (max. 20 MB).')
                 recipes=await hass.async_add_executor_job(parse_rtk,value)
             else:
                 if len(value)>2000:raise ValueError('URL zu lang.')
@@ -551,6 +629,7 @@ async def async_setup_entry(hass, entry):
     websocket_api.async_register_command(hass, ws_family_users)
     websocket_api.async_register_command(hass, ws_family_mobile_get)
     websocket_api.async_register_command(hass, ws_family_mobile_wish)
+    websocket_api.async_register_command(hass, ws_rtk_upload)
     websocket_api.async_register_command(hass, ws_import_preview)
     websocket_api.async_register_command(hass, ws_shopping_pro)
     websocket_api.async_register_command(hass, ws_modules)

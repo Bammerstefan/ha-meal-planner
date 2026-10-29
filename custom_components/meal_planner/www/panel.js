@@ -655,7 +655,7 @@ textarea{min-height:65px}label{display:block;font-size:13px;margin:10px 0 5px}.r
     }
     if(a==='recipeimport'){
       if(!this.hasModule('recipes_pro')){this.showError('Rezeptbuch PRO benötigt eine gültige Lizenz.');return;}
-      this.modal(`<h2>📥 Rezepte importieren</h2><p>Import aus My Recipe Box (.rtk) oder von einer Rezept-Webseite. Vor dem Speichern wird eine Vorschau angezeigt. Bereits vorhandene Rezepte werden nicht überschrieben.</p><label>My Recipe Box – RTK-Sicherungsdatei</label><input id="recipeImportFile" type="file" accept=".rtk,.zip"><button data-action="recipeimportfile">RTK-Datei prüfen</button><hr><label>Rezept von einer Webseite (HTTPS)</label><input id="recipeImportUrl" type="url" placeholder="https://beispiel.de/rezept/..."><button data-action="recipeimporturl">Webseite prüfen</button><p class="muted">Webseitenimport funktioniert nur, wenn die Seite strukturierte Rezeptdaten bereitstellt. Nicht alle Webseiten unterstützen das. Importierte Bilder aus RTK werden in dieser Version noch nicht übernommen.</p><div class="row"><button data-action="close">Schließen</button></div>`);return;
+      this.modal(`<h2>📥 Rezepte importieren</h2><p>Import aus My Recipe Box (.rtk) oder von einer Rezept-Webseite. Vor dem Speichern wird eine Vorschau angezeigt. Bereits vorhandene Rezepte werden nicht überschrieben.</p><label>My Recipe Box – RTK-Sicherungsdatei</label><input id="recipeImportFile" type="file" accept=".rtk,.zip"><button data-action="recipeimportfile">RTK-Datei prüfen</button><hr><label>Rezept von einer Webseite (HTTPS)</label><input id="recipeImportUrl" type="url" placeholder="https://beispiel.de/rezept/..."><button data-action="recipeimporturl">Webseite prüfen</button><p class="muted">Webseitenimport funktioniert nur, wenn die Seite strukturierte Rezeptdaten bereitstellt. Nicht alle Webseiten unterstützen das. RTK-Sicherungen bis 80 MB werden blockweise übertragen. Falls Bilder in der RTK-Datei enthalten sind, werden sie beim Import übernommen.</p><div class="row"><button data-action="close">Schließen</button></div>`);return;
     }
     if(a==='recipeimportfile'||a==='recipeimporturl'){
       try{
@@ -663,12 +663,23 @@ textarea{min-height:65px}label{display:block;font-size:13px;margin:10px 0 5px}.r
         if(a==='recipeimportfile'){
           source='rtk'; const file=this.shadowRoot.querySelector('#recipeImportFile')?.files?.[0];
           if(!file)throw Error('Bitte zuerst eine RTK-Datei auswählen.');
-          if(file.size>5_000_000)throw Error('RTK-Datei zu groß (max. 5 MB).');
-          const bytes=new Uint8Array(await file.arrayBuffer());let result='';
-          for(let i=0;i<bytes.length;i+=8192)result+=String.fromCharCode(...bytes.subarray(i,i+8192));
-          value=btoa(result);
+          if(file.size>80_000_000)throw Error('RTK-Datei zu groß (max. 80 MB).');
+          const chunkSize=192*1024;
+          await this.api({type:'meal_planner/rtk_upload',action:'start',size:file.size});
+          try{
+            for(let offset=0;offset<file.size;offset+=chunkSize){
+              const bytes=new Uint8Array(await file.slice(offset,offset+chunkSize).arrayBuffer());
+              let binary='';for(let j=0;j<bytes.length;j+=8192)binary+=String.fromCharCode(...bytes.subarray(j,j+8192));
+              await this.api({type:'meal_planner/rtk_upload',action:'chunk',data:btoa(binary)});
+            }
+            this._importUploadResult=await this.api({type:'meal_planner/rtk_upload',action:'finish'});
+          }catch(err){
+            try{await this.api({type:'meal_planner/rtk_upload',action:'cancel'});}catch(_){}
+            throw err;
+          }
         } else if(!value)throw Error('Bitte eine Rezept-URL eingeben.');
-        const result=await this.api({type:'meal_planner/import_preview',source,value});
+        const result=source==='rtk'?this._importUploadResult:await this.api({type:'meal_planner/import_preview',source,value});
+        this._importUploadResult=null;
         this._importPending=(result.recipes||[]).filter(x=>x.name);
         // Keep downloaded previews only until the user chooses an image.
         for(const recipe of this._importPending){

@@ -1,3 +1,8 @@
+## v1.0.9
+- My Recipe Box: Bilder aus RTK-Backups werden importiert.
+- Zusätzliche RTK-Bilder können in der Importvorschau ausgewählt werden.
+- Transparente Bilder werden beim Import auf weißem Hintergrund gespeichert.
+
 # Changelog
 
 ## 1.0.0 — Erstes Veröffentlichungspaket

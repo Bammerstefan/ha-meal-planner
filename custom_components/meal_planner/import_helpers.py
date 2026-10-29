@@ -8,6 +8,7 @@ import socket
 import zipfile
 from html.parser import HTMLParser
 from urllib.parse import urlsplit, urljoin
+from PIL import Image, ImageOps
 
 
 def _ingredients(value):
@@ -28,17 +29,73 @@ def _clean(s,limit):
     return str(s or '').strip()[:limit]
 
 
+
+def _image_to_data_url(raw, max_edge=640, quality=78):
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img=ImageOps.exif_transpose(img)
+            # Transparenz auf weißen Hintergrund legen, um schwarze Bilder zu vermeiden.
+            if img.mode in ('RGBA','LA') or (img.mode == 'P' and 'transparency' in img.info):
+                bg=Image.new('RGBA', img.size, (255,255,255,255))
+                bg.alpha_composite(img.convert('RGBA'))
+                img=bg.convert('RGB')
+            else:
+                img=img.convert('RGB')
+            img.thumbnail((max_edge,max_edge), Image.Resampling.LANCZOS)
+            out=io.BytesIO()
+            img.save(out, format='JPEG', quality=quality, optimize=True)
+            return 'data:image/jpeg;base64,' + base64.b64encode(out.getvalue()).decode('ascii')
+    except Exception:
+        return ''
+
+
+def _rtk_image_options(zip_file, recipe):
+    pictures=recipe.get('pictures') or []
+    if isinstance(pictures, str):
+        pictures=[pictures]
+    if not isinstance(pictures, list):
+        return []
+    # Bilddateien liegen meist direkt im Archiv und werden im JSON namentlich referenziert.
+    name_map={name.lower():name for name in zip_file.namelist()}
+    options=[]
+    seen=set()
+    for picture in pictures[:4]:
+        if not isinstance(picture, str) or not picture.strip():
+            continue
+        candidates=[picture.strip(), picture.strip().lstrip('/'), picture.strip().split('/')[-1]]
+        archive_name=''
+        for candidate in candidates:
+            archive_name=name_map.get(candidate.lower())
+            if archive_name:
+                break
+        if not archive_name or archive_name in seen:
+            continue
+        seen.add(archive_name)
+        try:
+            raw=zip_file.read(archive_name)
+        except KeyError:
+            continue
+        if len(raw) > 12_000_000:
+            continue
+        data=_image_to_data_url(raw)
+        if data:
+            options.append({'data': data, 'name': archive_name})
+    return options
+
+
 def parse_rtk(encoded):
-    raw=base64.b64decode(encoded,validate=True)
-    if len(raw)>5_000_000: raise ValueError('Die RTK-Datei ist zu groß (max. 5 MB).')
+    raw=encoded if isinstance(encoded, bytes) else base64.b64decode(encoded,validate=True)
+    if len(raw)>80_000_000: raise ValueError('Die RTK-Datei ist zu groß (max. 80 MB).')
     recipes=[]
     with zipfile.ZipFile(io.BytesIO(raw)) as z:
         names=z.namelist()
         if len(names)>1500: raise ValueError('Zu viele Einträge im Archiv.')
+        if sum(entry.file_size for entry in z.infolist()) > 350_000_000:
+            raise ValueError('Das entpackte RTK-Archiv ist zu groß (max. 350 MB).')
         for name in names:
             if not re.fullmatch(r'(?:[^/]+/)?recipes_\d+\.json',name):continue
             info=z.getinfo(name)
-            if info.file_size>4_000_000: raise ValueError('Die Rezeptliste im Archiv ist zu groß.')
+            if info.file_size>40_000_000: raise ValueError('Die Rezeptliste im Archiv ist zu groß (max. 40 MB pro Liste).')
             batch=json.loads(z.read(name))
             if not isinstance(batch,list):raise ValueError('Ungültiges RTK-Rezeptformat.')
             for r in batch:
@@ -50,7 +107,8 @@ def parse_rtk(encoded):
                 try: servings=max(1,min(50,int(r.get('quantity') or 4)))
                 except (ValueError,TypeError):servings=4
                 ins=_clean(r.get('instructions'),12000)
-                recipes.append({'name':title,'ingredients':_ingredients(r.get('ingredients')),'instructions':ins,'notes':ins,'category':category,'servings':servings,'photo_mode':'symbol','photo_symbol':'🍲','photo_data':'','source_url':_clean(r.get('url'),700),'source_id':_clean(r.get('uuid'),80)})
+                image_options=_rtk_image_options(z, r)
+                recipes.append({'name':title,'ingredients':_ingredients(r.get('ingredients')),'instructions':ins,'notes':ins,'category':category,'servings':servings,'photo_mode':'custom' if image_options else 'symbol','photo_symbol':'🍲','photo_data':(image_options[0]['data'] if image_options else ''),'image_options':image_options,'source_url':_clean(r.get('url'),700),'source_id':_clean(r.get('uuid'),80)})
                 if len(recipes)>500:raise ValueError('Maximal 500 Rezepte pro Import.')
     if not recipes:raise ValueError('Keine Rezepte in der RTK-Datei gefunden.')
     return recipes
