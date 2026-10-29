@@ -16,9 +16,13 @@ from homeassistant.core import callback
 from homeassistant.helpers.storage import Store
 from .const import DOMAIN, PANEL_PATH
 from .licenses import MODULES, verify_license
+from .import_helpers import parse_rtk, parse_webpage, public_hostname, public_dns_addresses
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+import asyncio
+import socket
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.2"
+UI_VERSION = "1.0.3"
 
 # Mengen für Warnungen auf eine gemeinsame Basiseinheit umrechnen.
 def _quantity(raw):
@@ -113,6 +117,47 @@ async def async_setup_entry(hass, entry):
 
     unsubscribe = async_track_time_change(hass, _daily_reminders, minute=0, second=0)
     hass.data[DOMAIN]["reminder_unsubscribe"] = unsubscribe
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/import_preview', vol.Required('source'): vol.In(['rtk','url']), vol.Required('value'): str})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_import_preview(hass, connection, msg):
+        active = set()
+        lic = hass.data[DOMAIN]['license_data']
+        for token in lic.get('tokens', []):
+            try: active.update(verify_license(token,lic['installation_id'])['modules'])
+            except ValueError: continue
+        if 'recipes_pro' not in active:
+            connection.send_error(msg['id'], 'license_required', 'Rezeptbuch PRO benötigt eine gültige Lizenz.')
+            return
+        try:
+            value=msg['value']
+            if msg['source']=='rtk':
+                if len(value)>7_000_000:raise ValueError('Die Datei ist zu groß.')
+                recipes=await hass.async_add_executor_job(parse_rtk,value)
+            else:
+                if len(value)>2000:raise ValueError('URL zu lang.')
+                host=public_hostname(value)
+                # Validate DNS before requesting; Home Assistant's HTTP session supplies
+                # TLS verification and its own redirect protections. No redirects allowed.
+                records=await asyncio.get_running_loop().getaddrinfo(host,443,type=socket.SOCK_STREAM)
+                public_dns_addresses([r[4][0] for r in records])
+                session=async_get_clientsession(hass)
+                import aiohttp
+                async with session.get(value,allow_redirects=False,timeout=aiohttp.ClientTimeout(total=12),headers={'Accept':'text/html,application/xhtml+xml'}) as response:
+                    if response.status in (301,302,303,307,308):raise ValueError('Weiterleitungen sind aus Sicherheitsgründen nicht unterstützt.')
+                    if response.status!=200:raise ValueError(f'Webseite meldet HTTP {response.status}.')
+                    if not any(x in response.headers.get('Content-Type','').lower() for x in ('text/html','application/xhtml+xml')):raise ValueError('Keine HTML-Webseite.')
+                    if response.content_length and response.content_length>1_000_000:raise ValueError('Webseite zu groß.')
+                    raw=await response.content.read(1_000_001)
+                    if len(raw)>1_000_000:raise ValueError('Webseite zu groß.')
+                    html=raw.decode(response.charset or 'utf-8',errors='replace')
+                recipes=parse_webpage(html,value)
+            connection.send_result(msg['id'],{'recipes':recipes})
+        except (ValueError,TimeoutError,OSError,UnicodeError,ImportError,KeyError) as exc:
+            connection.send_error(msg['id'],'import_failed',str(exc)[:400])
+        except Exception:
+            connection.send_error(msg['id'],'import_failed','Import konnte nicht verarbeitet werden.')
 
     @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/version"})
     @websocket_api.require_admin
@@ -471,6 +516,7 @@ async def async_setup_entry(hass, entry):
     websocket_api.async_register_command(hass, ws_family_users)
     websocket_api.async_register_command(hass, ws_family_mobile_get)
     websocket_api.async_register_command(hass, ws_family_mobile_wish)
+    websocket_api.async_register_command(hass, ws_import_preview)
     websocket_api.async_register_command(hass, ws_shopping_pro)
     websocket_api.async_register_command(hass, ws_modules)
     websocket_api.async_register_command(hass, ws_license_transfer_request)
