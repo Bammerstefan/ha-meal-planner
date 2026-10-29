@@ -99,6 +99,48 @@ def recipe_image_url(value, page_url):
     return ''
 
 
+
+class _ImageFinder(HTMLParser):
+    """Collect public image URLs from recipe metadata and actual content images."""
+    def __init__(self, page_url):
+        super().__init__(); self.page_url=page_url; self.candidates=[]
+    def handle_starttag(self, tag, attrs):
+        props=dict(attrs)
+        if tag=='meta' and (props.get('property','').lower() in ('og:image','og:image:url','twitter:image') or props.get('name','').lower() in ('twitter:image',)):
+            self.candidates.append(props.get('content',''))
+        if tag=='img':
+            for key in ('data-src','data-lazy-src','data-original','src'):
+                value=props.get(key,'')
+                if value and not value.startswith(('data:','blob:')):self.candidates.append(value)
+            for key in ('data-srcset','srcset'):
+                for part in props.get(key,'').split(',')[-3:]:
+                    value=part.strip().split(' ')[0]
+                    if value:self.candidates.append(value)
+
+
+def recipe_image_urls(schema_image, html, page_url):
+    """Candidate order: Recipe schema, OG/Twitter metadata, content images."""
+    raw=[]
+    values=schema_image if isinstance(schema_image,list) else [schema_image]
+    for item in values[:16]:
+        if isinstance(item,dict):item=item.get('url') or item.get('contentUrl') or item.get('thumbnailUrl')
+        if isinstance(item,str):raw.append(item)
+    finder=_ImageFinder(page_url)
+    finder.feed(html)
+    raw.extend(finder.candidates[:100])
+    unique=[];seen=set()
+    for value in raw:
+        if not isinstance(value,str) or not value.strip():continue
+        url=urljoin(page_url,value.strip())
+        if len(url)>2000 or url in seen:continue
+        try:public_hostname(url)
+        except (ValueError,TypeError):continue
+        if re.search(r'\.(?:svg|gif)(?:[?#]|$)',url,re.I):continue
+        seen.add(url);unique.append(url)
+        if len(unique)>=16:break
+    return unique
+
+
 def parse_webpage(html,url):
     parser=_JsonLd();parser.feed(html)
     for block in parser.blocks:
@@ -116,7 +158,7 @@ def parse_webpage(html,url):
         m=re.search(r'\d+',str(servings));servings=max(1,min(50,int(m.group()) if m else 4))
         category=r.get('recipeCategory','');category=category[0] if isinstance(category,list) and category else category
         instruction=_clean(instruction,12000)
-        return [{'name':title,'ingredients':_ingredients(r.get('recipeIngredient',[])),'instructions':instruction,'notes':instruction,'category':_clean(category,60),'servings':servings,'photo_mode':'symbol','photo_symbol':'🍲','photo_data':'','image_url':recipe_image_url(r.get('image') or r.get('thumbnailUrl'),url),'source_url':url}]
+        return [{'name':title,'ingredients':_ingredients(r.get('recipeIngredient',[])),'instructions':instruction,'notes':instruction,'category':_clean(category,60),'servings':servings,'photo_mode':'symbol','photo_symbol':'🍲','photo_data':'','image_url':recipe_image_url(r.get('image') or r.get('thumbnailUrl'),url),'image_candidates':recipe_image_urls(r.get('image') or r.get('thumbnailUrl'),html,url),'source_url':url}]
     raise ValueError('Diese Webseite enthält keine erkennbaren strukturierten Rezeptdaten (schema.org/Recipe).')
 
 

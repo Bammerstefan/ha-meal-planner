@@ -1,7 +1,7 @@
 {
   "domain": "meal_planner",
   "name": "Mein Speiseplan",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "documentation": "https://github.com/Bammerstefan/ha-meal-planner",
   "issue_tracker": "https://github.com/Bammerstefan/ha-meal-planner/issues",
   "codeowners": [
