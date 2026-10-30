@@ -25,7 +25,7 @@ import tempfile
 import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.10"
+UI_VERSION = "1.0.11"
 
 # Mengen für Warnungen auf eine gemeinsame Basiseinheit umrechnen.
 def _quantity(raw):
