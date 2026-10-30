@@ -21,11 +21,12 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import asyncio
 import socket
 import base64
+import json
 import tempfile
 import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.11"
+UI_VERSION = "1.0.13"
 
 # Mengen für Warnungen auf eine gemeinsame Basiseinheit umrechnen.
 def _quantity(raw):
@@ -402,6 +403,81 @@ async def async_setup_entry(hass, entry):
             hass.data[DOMAIN]['data'] = updated
         connection.send_result(msg['id'], {'added': len(new), 'skipped': len(batch) - len(new)})
 
+    # Separate, atomare Wiederherstellung großer JSON-Backups (ohne Lizenzdaten).
+    restore_uploads = {}
+
+    def _clear_restore(key):
+        upload = restore_uploads.pop(key, None)
+        if upload:
+            try: os.unlink(upload['path'])
+            except OSError: pass
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/restore_upload',
+        vol.Required('action'): vol.In(['start', 'chunk', 'finish', 'cancel']),
+        vol.Optional('size', default=0): vol.All(int, vol.Range(min=0)),
+        vol.Optional('data', default=''): str})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_restore_upload(hass, connection, msg):
+        key=id(connection)
+        try:
+            for other, state in list(restore_uploads.items()):
+                if monotonic()-state['created']>900:
+                    _clear_restore(other)
+            action=msg['action']
+            if action=='cancel':
+                _clear_restore(key)
+                connection.send_result(msg['id'], {'cancelled':True})
+                return
+            if action=='start':
+                _clear_restore(key)
+                size=msg['size']
+                if not 0<size<=25_000_000: raise ValueError('Sicherungsdaten zu groß (max. 25 MB ohne Bilder).')
+                fd,path=tempfile.mkstemp(prefix='meal_restore_',suffix='.json')
+                os.close(fd)
+                restore_uploads[key]={'path':path,'size':size,'written':0,'created':monotonic()}
+                connection.send_result(msg['id'], {'ready':True})
+                return
+            upload=restore_uploads.get(key)
+            if not upload: raise ValueError('Wiederherstellungssitzung abgelaufen.')
+            if action=='chunk':
+                encoded=msg['data']
+                if not 0<len(encoded)<=190_000: raise ValueError('Datenblock zu groß.')
+                block=base64.b64decode(encoded,validate=True)
+                if len(block)>128*1024 or upload['written']+len(block)>upload['size']:
+                    raise ValueError('Ungültige Blocklänge.')
+                with open(upload['path'],'ab') as stream: stream.write(block)
+                upload['written']+=len(block)
+                connection.send_result(msg['id'],{'received':upload['written']})
+                return
+            if upload['written']!=upload['size']:
+                raise ValueError('Sicherung unvollständig übertragen.')
+            def _parse():
+                with open(upload['path'],'rb') as stream:
+                    incoming=json.loads(stream.read())
+                if not isinstance(incoming,dict) or not isinstance(incoming.get('recipes'),list) or not isinstance(incoming.get('plans'),dict) or not isinstance(incoming.get('shopping'),dict):
+                    raise ValueError('Ungültige Speiseplan-Sicherung.')
+                if len(incoming['recipes'])>10000: raise ValueError('Zu viele Rezepte.')
+                for recipe in incoming['recipes']:
+                    if not isinstance(recipe,dict):raise ValueError('Ungültige Rezeptdaten.')
+                    ref=recipe.get('photo_ref')
+                    if ref and (not isinstance(ref,str) or not re.fullmatch('[a-f0-9]{32}',ref) or not (images_dir/(ref+'.jpg')).is_file()):
+                        raise ValueError('Ein Rezeptbild fehlt. Daten wurden nicht ersetzt.')
+                return incoming
+            incoming=await hass.async_add_executor_job(_parse)
+            # Alte Einstellungen & Lizenzdatei unangetastet; Speiseplandaten atomar ersetzen.
+            await store.async_save(incoming)
+            hass.data[DOMAIN]['data']=incoming
+            connection.send_result(msg['id'],{'restored':True,'recipes':len(incoming['recipes'])})
+        except (ValueError,OSError,UnicodeError,json.JSONDecodeError) as exc:
+            _clear_restore(key)
+            connection.send_error(msg['id'],'restore_failed',str(exc)[:350])
+        except Exception:
+            _clear_restore(key)
+            connection.send_error(msg['id'],'restore_failed','Wiederherstellung fehlgeschlagen. Vorhandene Daten bleiben erhalten.')
+        finally:
+            if msg['action']=='finish': _clear_restore(key)
+
     @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/version"})
     @websocket_api.require_admin
     @websocket_api.async_response
@@ -769,6 +845,7 @@ async def async_setup_entry(hass, entry):
     websocket_api.async_register_command(hass, ws_version)
     websocket_api.async_register_command(hass, ws_rtk_preview_page)
     websocket_api.async_register_command(hass, ws_photo_store)
+    websocket_api.async_register_command(hass, ws_restore_upload)
     websocket_api.async_register_command(hass, ws_photo_get)
     websocket_api.async_register_command(hass, ws_import_recipe_batch)
     websocket_api.async_register_command(hass, ws_get)
