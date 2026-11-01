@@ -2,10 +2,10 @@
 from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 import re
 from homeassistant.util import dt as dt_util
-from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 import uuid
 from collections import deque
 from time import monotonic
@@ -15,7 +15,7 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.core import callback
 from homeassistant.helpers.storage import Store
 from .const import DOMAIN, PANEL_PATH
-from .licenses import MODULES, verify_license
+from .licenses import MODULES, verify_license as verify_license_signature
 from .import_helpers import parse_rtk, parse_webpage, public_hostname, public_dns_addresses
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import asyncio
@@ -26,7 +26,9 @@ import tempfile
 import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.14"
+UI_VERSION = "1.0.16"
+LICENSE_STATUS_BASE = "https://bamlabs.at/wp-json/bamlabs/v1/license-status/"
+LICENSE_GRACE_DAYS = 14
 
 # Mengen für Warnungen auf eine gemeinsame Basiseinheit umrechnen.
 def _quantity(raw):
@@ -88,6 +90,57 @@ async def async_setup_entry(hass, entry):
         license_data["tokens"] = []
         await license_store.async_save(license_data)
     hass.data[DOMAIN] = {"entry": entry, "store": store, "data": data, "license_store": license_store, "license_data": license_data}
+    # Signed token validation remains local. Only random license IDs are checked remotely.
+    # A confirmed revocation persists offline; a temporary network outage does not erase state.
+    license_data.setdefault('license_status_cache', {})
+    def verify_license(token, installation_id):
+        payload = verify_license_signature(token, installation_id)
+        state = license_data['license_status_cache'].get(payload['license_id'], {})
+        if state.get('status') == 'revoked':
+            raise ValueError('Lizenz wurde nach Gerätewechsel ersetzt')
+        if state.get('status') == 'active':
+            try:
+                seen = datetime.fromisoformat(state['checked_at'])
+                if datetime.now(timezone.utc) - seen > timedelta(days=LICENSE_GRACE_DAYS):
+                    raise ValueError('Online-Lizenzprüfung seit mehr als 14 Tagen nicht möglich')
+            except (ValueError, KeyError, TypeError) as exc:
+                if isinstance(exc, ValueError) and 'Online-Lizenzprüfung' in str(exc):
+                    raise
+        # Legacy/unknown keys stay valid offline for backwards compatibility.
+        return payload
+
+    async def refresh_license_status(_now=None):
+        tokens = list(license_data.get('tokens', []))
+        session = async_get_clientsession(hass)
+        changed = False
+        for token in tokens:
+            try:
+                payload = verify_license_signature(token, license_data['installation_id'])
+                lid = payload['license_id']
+                async with asyncio.timeout(8):
+                    async with session.get(LICENSE_STATUS_BASE + lid, allow_redirects=False) as response:
+                        if response.status != 200: continue
+                        result = await response.json(content_type='application/json')
+                status = result.get('status') if isinstance(result, dict) else None
+                if status not in ('active', 'revoked', 'unknown'): continue
+                previous = license_data['license_status_cache'].get(lid, {})
+                # Unknown means the server has no status record (e.g. older license).
+                if status == 'unknown': continue
+                if previous.get('status') == 'revoked' and status != 'revoked':
+                    continue  # prevent accidental restoration after a transient server issue
+                license_data['license_status_cache'][lid] = {'status': status, 'checked_at': datetime.now(timezone.utc).isoformat()}
+                changed = True
+            except (OSError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
+                continue
+            except Exception:
+                continue  # never make Home Assistant startup depend on the shop
+        if changed:
+            await license_store.async_save(license_data)
+
+    # Non-blocking initial check plus periodic polling every 6 hours.
+    hass.async_create_task(refresh_license_status())
+    license_status_unsubscribe = async_track_time_interval(hass, refresh_license_status, timedelta(hours=6))
+    hass.data[DOMAIN]["license_status_unsubscribe"] = license_status_unsubscribe
 
     # Ein einzelner lokaler Zeit-Callback statt dauerhaft laufender Polling-Schleife.
     # Home Assistant persistent notifications, optional und nur bei aktivierten Einstellungen.
@@ -573,6 +626,38 @@ async def async_setup_entry(hass, entry):
             existing.add(normalized)
         connection.send_result(msg["id"], {"added": added, "skipped": skipped, "target": entity_id})
 
+    def license_status_summary():
+        """Read-only status; never expose tokens or reveal the remote license IDs."""
+        lic = hass.data[DOMAIN]["license_data"]
+        cache = lic.get("license_status_cache", {})
+        result = []
+        for token in lic.get("tokens", []):
+            try:
+                payload = verify_license_signature(token, lic["installation_id"])
+                row = cache.get(payload["license_id"], {})
+                status = row.get("status", "unknown")
+                checked_at = row.get("checked_at")
+                remaining = None
+                if status == "active" and checked_at:
+                    try:
+                        dt = datetime.fromisoformat(checked_at)
+                        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+                        remaining = max(0, int((dt + timedelta(days=LICENSE_GRACE_DAYS) - datetime.now(timezone.utc)).total_seconds()))
+                    except (ValueError, TypeError):
+                        pass
+                result.append({"status": status, "checked_at": checked_at, "offline_remaining_seconds": remaining,
+                               "modules": payload.get("modules", [])})
+            except (ValueError, KeyError, TypeError):
+                result.append({"status": "invalid", "checked_at": None, "offline_remaining_seconds": None, "modules": []})
+        return {"licenses": result, "check_interval_hours": 6, "grace_days": LICENSE_GRACE_DAYS}
+
+    @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/license_status_check"})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_license_status_check(hass, connection, msg):
+        await refresh_license_status()
+        connection.send_result(msg["id"], license_status_summary())
+
     @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/modules"})
     @websocket_api.require_admin
     @websocket_api.async_response
@@ -584,7 +669,7 @@ async def async_setup_entry(hass, entry):
                 active.update(verify_license(token, lic["installation_id"])["modules"])
             except ValueError:
                 continue
-        connection.send_result(msg["id"], {"installation_id": lic["installation_id"], "modules": [{"id": mid, "name": name, "active": mid in active} for mid, name in MODULES.items()]})
+        connection.send_result(msg["id"], {"installation_id": lic["installation_id"], "modules": [{"id": mid, "name": name, "active": mid in active} for mid, name in MODULES.items()], "license_status": license_status_summary()})
 
     @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/license_transfer_request"})
     @websocket_api.require_admin
@@ -839,6 +924,7 @@ async def async_setup_entry(hass, entry):
     websocket_api.async_register_command(hass, ws_import_preview)
     websocket_api.async_register_command(hass, ws_shopping_pro)
     websocket_api.async_register_command(hass, ws_modules)
+    websocket_api.async_register_command(hass, ws_license_status_check)
     websocket_api.async_register_command(hass, ws_license_transfer_request)
     websocket_api.async_register_command(hass, ws_activate)
     websocket_api.async_register_command(hass, ws_qr)
@@ -877,5 +963,8 @@ async def async_unload_entry(hass, entry):
     unsubscribe = state.get("reminder_unsubscribe")
     if unsubscribe:
         unsubscribe()
+    status_unsubscribe = state.get("license_status_unsubscribe")
+    if status_unsubscribe:
+        status_unsubscribe()
     hass.data.pop(DOMAIN, None)
     return True
