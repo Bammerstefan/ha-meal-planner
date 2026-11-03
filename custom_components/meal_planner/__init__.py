@@ -26,7 +26,7 @@ import tempfile
 import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.16"
+UI_VERSION = "1.0.17"
 LICENSE_STATUS_BASE = "https://bamlabs.at/wp-json/bamlabs/v1/license-status/"
 LICENSE_GRACE_DAYS = 14
 
