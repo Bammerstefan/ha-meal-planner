@@ -113,16 +113,25 @@ async def async_setup_entry(hass, entry):
         tokens = list(license_data.get('tokens', []))
         session = async_get_clientsession(hass)
         changed = False
+        report = {'checked': 0, 'active': 0, 'revoked': 0, 'unknown': 0, 'errors': 0, 'details': []}
         for token in tokens:
             try:
                 payload = verify_license_signature(token, license_data['installation_id'])
                 lid = payload['license_id']
                 async with asyncio.timeout(8):
                     async with session.get(LICENSE_STATUS_BASE + lid, allow_redirects=False) as response:
-                        if response.status != 200: continue
+                        if response.status != 200:
+                            report['errors'] += 1
+                            report['details'].append('Lizenzserver meldet HTTP ' + str(response.status))
+                            continue
                         result = await response.json(content_type='application/json')
+                report['checked'] += 1
                 status = result.get('status') if isinstance(result, dict) else None
-                if status not in ('active', 'revoked', 'unknown'): continue
+                if status not in ('active', 'revoked', 'unknown'):
+                    report['errors'] += 1
+                    report['details'].append('Unerwartete Antwort des Lizenzservers')
+                    continue
+                report[status] += 1
                 previous = license_data['license_status_cache'].get(lid, {})
                 # Unknown means the server has no status record (e.g. older license).
                 if status == 'unknown': continue
@@ -130,12 +139,17 @@ async def async_setup_entry(hass, entry):
                     continue  # prevent accidental restoration after a transient server issue
                 license_data['license_status_cache'][lid] = {'status': status, 'checked_at': datetime.now(timezone.utc).isoformat()}
                 changed = True
-            except (OSError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
+            except (OSError, asyncio.TimeoutError, ValueError, KeyError, TypeError) as exc:
+                report['errors'] += 1
+                report['details'].append(type(exc).__name__)
                 continue
-            except Exception:
+            except Exception as exc:
+                report['errors'] += 1
+                report['details'].append(type(exc).__name__)
                 continue  # never make Home Assistant startup depend on the shop
         if changed:
             await license_store.async_save(license_data)
+        return report
 
     # Non-blocking initial check plus periodic polling every 6 hours.
     hass.async_create_task(refresh_license_status())
@@ -655,8 +669,10 @@ async def async_setup_entry(hass, entry):
     @websocket_api.require_admin
     @websocket_api.async_response
     async def ws_license_status_check(hass, connection, msg):
-        await refresh_license_status()
-        connection.send_result(msg["id"], license_status_summary())
+        report = await refresh_license_status()
+        summary = license_status_summary()
+        summary['check_report'] = report
+        connection.send_result(msg["id"], summary)
 
     @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/modules"})
     @websocket_api.require_admin
