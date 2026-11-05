@@ -27,7 +27,7 @@ import tempfile
 import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.18"
+UI_VERSION = "1.0.19"
 LICENSE_STATUS_BASE = "https://bamlabs.at/wp-json/bamlabs/v1/license-status/"
 LICENSE_GRACE_DAYS = 14
 
@@ -495,9 +495,10 @@ async def async_setup_entry(hass, entry):
                 portions = max(1, min(50, int(source.get('servings', 4))))
             except (TypeError, ValueError):
                 portions = 4
-            instructions = str(source.get('instructions', source.get('notes', '')))[:12000]
+            instructions = str(source.get('instructions', '') or '')[:12000]
+            notes = str(source.get('notes', '') or '')[:12000]
             new.append({'id': uuid.uuid4().hex, 'name': name, 'ingredients': clean_ingredients,
-                'instructions': instructions, 'notes': instructions,
+                'instructions': instructions, 'notes': notes,
                 'category': str(source.get('category', ''))[:60], 'servings': portions,
                 'photo_mode': 'custom' if ref else 'symbol', 'photo_symbol': '🍲',
                 'photo_data': '', 'photo_ref': ref,

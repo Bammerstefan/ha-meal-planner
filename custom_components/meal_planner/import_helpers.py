@@ -107,8 +107,11 @@ def parse_rtk(encoded):
                 try: servings=max(1,min(50,int(r.get('quantity') or 4)))
                 except (ValueError,TypeError):servings=4
                 ins=_clean(r.get('instructions'),12000)
+                # My Recipe Box stores personal notes separately from instructions.
+                # Keep both independent; do not turn instructions into notes.
+                notes=_clean(r.get('notes'),12000)
                 image_options=_rtk_image_options(z, r)
-                recipes.append({'name':title,'ingredients':_ingredients(r.get('ingredients')),'instructions':ins,'notes':ins,'category':category,'servings':servings,'photo_mode':'custom' if image_options else 'symbol','photo_symbol':'🍲','photo_data':(image_options[0]['data'] if image_options else ''),'image_options':image_options,'source_url':_clean(r.get('url'),700),'source_id':_clean(r.get('uuid'),80)})
+                recipes.append({'name':title,'ingredients':_ingredients(r.get('ingredients')),'instructions':ins,'notes':notes,'category':category,'servings':servings,'photo_mode':'custom' if image_options else 'symbol','photo_symbol':'🍲','photo_data':(image_options[0]['data'] if image_options else ''),'image_options':image_options,'source_url':_clean(r.get('url'),700),'source_id':_clean(r.get('uuid'),80)})
                 if len(recipes)>500:raise ValueError('Maximal 500 Rezepte pro Import.')
     if not recipes:raise ValueError('Keine Rezepte in der RTK-Datei gefunden.')
     return recipes
