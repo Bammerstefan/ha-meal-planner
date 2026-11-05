@@ -17,6 +17,7 @@ from homeassistant.helpers.storage import Store
 from .const import DOMAIN, PANEL_PATH
 from .licenses import MODULES, verify_license as verify_license_signature
 from .import_helpers import parse_rtk, parse_webpage, public_hostname, public_dns_addresses
+from .rtk_export import build_rtk
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import asyncio
 import socket
@@ -26,7 +27,7 @@ import tempfile
 import os
 
 STORAGE_VERSION = 1
-UI_VERSION = "1.0.17"
+UI_VERSION = "1.0.18"
 LICENSE_STATUS_BASE = "https://bamlabs.at/wp-json/bamlabs/v1/license-status/"
 LICENSE_GRACE_DAYS = 14
 
@@ -361,6 +362,50 @@ async def async_setup_entry(hass, entry):
     # Only authenticated administrators can write/read these files through WebSockets.
     images_dir = Path(hass.config.path(".storage", "meal_planner_images"))
     images_dir.mkdir(parents=True, exist_ok=True)
+
+    # Authenticated RTK export in bounded WebSocket chunks; no persistent files.
+    rtk_exports = {}
+
+    @websocket_api.websocket_command({vol.Required('type'): f'{DOMAIN}/rtk_export',
+        vol.Required('action'): vol.In(['start', 'chunk', 'finish']),
+        vol.Optional('offset', default=0): vol.All(int, vol.Range(min=0))})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_rtk_export(hass, connection, msg):
+        key = id(connection)
+        action = msg['action']
+        if action == 'finish':
+            rtk_exports.pop(key, None)
+            connection.send_result(msg['id'], {'finished': True})
+            return
+        if not recipes_license_active():
+            connection.send_error(msg['id'], 'license_required', 'Rezeptbuch PRO benötigt eine gültige Lizenz.')
+            return
+        try:
+            if action == 'start':
+                rtk_exports.pop(key, None)
+                current = hass.data[DOMAIN]['data']
+                # Copy just recipes so edits during export do not change the archive.
+                exported = deepcopy(current.get('recipes', []))
+                raw, count, pictures = await hass.async_add_executor_job(build_rtk, exported, images_dir)
+                rtk_exports[key] = {'raw': raw, 'created': monotonic()}
+                connection.send_result(msg['id'], {'size': len(raw), 'recipes': count, 'pictures': pictures, 'chunk_size': 196608})
+                return
+            export = rtk_exports.get(key)
+            if not export or monotonic() - export['created'] > 900:
+                rtk_exports.pop(key, None)
+                raise ValueError('Export abgelaufen. Bitte erneut starten.')
+            offset = msg['offset']
+            raw = export['raw']
+            if offset > len(raw):
+                raise ValueError('Ungültiger Dateiabschnitt.')
+            block = raw[offset:offset+196608]
+            connection.send_result(msg['id'], {'data': base64.b64encode(block).decode('ascii'), 'next_offset': offset+len(block), 'done': offset+len(block) >= len(raw)})
+        except (ValueError, OSError, TypeError) as exc:
+            connection.send_error(msg['id'], 'rtk_export_failed', str(exc)[:250])
+        except Exception:
+            connection.send_error(msg['id'], 'rtk_export_failed', 'RTK-Export fehlgeschlagen.')
+
 
     def recipes_license_active():
         lic = hass.data[DOMAIN]['license_data']
@@ -936,6 +981,7 @@ async def async_setup_entry(hass, entry):
     websocket_api.async_register_command(hass, ws_family_users)
     websocket_api.async_register_command(hass, ws_family_mobile_get)
     websocket_api.async_register_command(hass, ws_family_mobile_wish)
+    websocket_api.async_register_command(hass, ws_rtk_export)
     websocket_api.async_register_command(hass, ws_rtk_upload)
     websocket_api.async_register_command(hass, ws_import_preview)
     websocket_api.async_register_command(hass, ws_shopping_pro)
